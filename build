@@ -1,0 +1,154 @@
+#!/bin/sh
+set -e -u
+
+dirBuild=$( pwd )
+dirProj=$( dirname "$0" )
+
+. "$dirProj/inc/common.inc"
+
+dirSrc="$dirProj/src"
+
+dirObj="$dirBuild/src"
+fileLastBuildConf="$dirBuild/last.cfg"
+fileSrcFileList="$dirBuild/srcfiles.txt"
+
+
+
+printHelp( )
+{
+	helpText="
+
+SYNTAX
+------
+
+    ./build <action> [option] [option] ...
+
+
+ACTIONS
+-------
+
+    help          Show this help screen.
+    clean         Clean all build products.
+    list          List available build styles.
+    <style>       Make a build using selected style.
+
+
+OPTIONS
+-------
+
+    -clean        Make a clean build.
+"
+	printf '%s' "$helpText"
+	exit "$1"
+}
+
+
+[ $# -gt 0 ] || syntaxError "Missing action"
+
+
+listBuildStyles( )
+{
+	printf '%s' "
+Available build styles:
+
+"
+	for style in "$dirProj/cfg/"*.cfg
+	do
+		[ -f "$style" ] || continue
+		style="$( basename "$style" )"
+		printf -- '- %s\n' "${style%.cfg}"
+	done
+}
+
+
+cleanBuildProducts( )
+{
+	printf '\nCleaning build directory.\n'
+	rm -rf "$fileLastBuildConf" "$dirObj"
+}
+
+
+buildStyle=
+case $1 in
+	help) printHelp 0 ;;
+	list) listBuildStyles; exit 0;;
+	clean) cleanBuildProducts; exit 0;;
+	*) buildStyle=$1; shift
+esac
+
+fileBuildConf="$dirProj/cfg/$buildStyle.cfg"
+[ -f "$fileBuildConf" ] || error "Build style $buildStyle not found"
+
+
+optClean=
+while [ $# -gt 0 ]
+do
+	case $1 in
+		-clean) optClean=1;;
+		*) syntaxError "Unknow option: $1"
+	esac
+	shift
+done
+
+printf '\n=== BUILDING ===\n\n'
+printf 'Building using build style: "%s".\n' "$buildStyle"
+
+
+if [ -z "$optClean" ] \
+	&& [ -f "$fileLastBuildConf" ] \
+	&& ! cmp -s "$fileLastBuildConf" "$fileBuildConf"
+then
+	optClean=1
+	printf '\nForcing clean buid because build config has changed.\n'
+fi
+
+[ -n "$optClean" ] && cleanBuildProducts
+
+[ ! -f "$fileLastBuildConf" ] && cp "$fileBuildConf" "$fileLastBuildConf"
+[ ! -d "$dirObj" ] && mkdir -p "$dirObj"
+
+
+config=$( parseBuildSettingsFile "$fileLastBuildConf" )
+if useiOSSDK "$config"
+then
+	# Get path of latest ios SDK
+	sdkPath=$( xcrun --sdk iphoneos --show-sdk-path )
+	config="$config -isysroot $( quote "$sdkPath" )"
+fi
+
+
+find "$dirSrc" -name "*.c" >"$fileSrcFileList"
+find "$dirSrc" -name "*.m" >>"$fileSrcFileList"
+
+while IFS='' read -r nextSrcFile
+do
+	relativeSrcFile=$( relativePath "$nextSrcFile" "$dirSrc" )
+	nextObjFile="$dirObj/$relativeSrcFile.o"
+	relativeObjFile=$( relativePath "$nextObjFile" "$dirObj" )
+
+	printf '\nBuilding: "%s"\n' "$relativeSrcFile"
+
+	flagsFile=$( findCompileFlags "$nextSrcFile" "$dirProj" )
+	flagsFileDir="$( dirname "$flagsFile" )"
+	flags=$( parseBuildSettingsFile "$flagsFile" "^ *-mmacos-version-min")
+
+	if ! objectFileIsOutdated \
+		"$nextObjFile" "$nextSrcFile" "$flags" "$flagsFileDir"
+	then
+		printf 'Object file up to date: "%s"\n' "$relativeObjFile"
+		continue
+	fi
+
+	buildCmd="clang -c -o $( quote "$nextObjFile" )"
+	buildCmd="$buildCmd $flags $config"
+	buildCmd="$buildCmd $(quote "$nextSrcFile" )"
+
+	( cd "$flagsFileDir" && eval "$buildCmd" )
+
+	relativeObjFile=$( relativePath "$nextObjFile" "$dirObj" )
+	printf 'Created: "%s"\n' "$relativeObjFile"
+
+done <"$fileSrcFileList"
+
+
+printf '\n=== BUILDING DONE ===\n'

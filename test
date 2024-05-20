@@ -1,0 +1,277 @@
+#!/bin/sh
+set -e -u
+
+dirBuild=$( pwd )
+dirProj=$( dirname "$0" )
+
+. "$dirProj/inc/common.inc"
+
+dirTests="$dirProj/tests"
+
+dirObj="$dirBuild/tests"
+dirBin="$dirBuild/bin"
+fileLastBuildConf="$dirBuild/last.cfg"
+fileObjFileList="$dirObj/srcfiles.txt"
+fileSrcFileList="$dirBuild/srcfiles.txt"
+
+dirSrcBuild="$dirBuild/build"
+
+
+printHelp( )
+{
+	helpText="
+
+SYNTAX
+------
+
+    ./test <action> [option] [option] ...
+
+
+ACTIONS
+-------
+
+    help          Show this help screen.
+    clean         Clean all build products.
+    list          List available test suites.
+    <suite>       Run specified test suite.
+
+
+OPTIONS
+-------
+
+    -clean        Make a clean build.
+    -norun        Build tests but don't run them.-
+    -debug        Build test suite with debug config.
+"
+	printf '%s' "$helpText"
+	exit "$1"
+}
+
+
+[ $# -gt 0 ] || syntaxError "Missing style"
+
+
+listTests( )
+{
+	printf '%s' "
+Available test suites:
+
+- all
+"
+	for suite in "$dirProj/tests/"*
+	do
+		[ -d "$suite" ] || continue
+		suite="$( basename "$suite" )"
+		[ "$suite" = "_common" ] && continue
+		printf -- '- %s\n' "$suite"
+	done
+}
+
+
+cleanBuildProducts( )
+{
+	printf '\nCleaning test build directory.\n'
+	rm -rf "$fileLastBuildConf" "$dirObj"
+}
+
+
+cleanSrcBuildProducts( )
+(
+	if [ -d "$dirSrcBuild" ]
+	then
+		cd "$dirSrcBuild"
+		"$dirProj/build" clean
+	fi
+)
+
+
+suite=
+case $1 in
+	help) printHelp 0 ;;
+	list) listTests; exit 0;;
+	clean) cleanSrcBuildProducts; cleanBuildProducts; exit 0;;
+	*) suite=$1; shift
+esac
+
+dirSuite=
+commonSuite="$dirTests/_common"
+
+if [ "$suite" = "all" ]
+then
+	dirSuite="$dirTests"
+else
+	[ "$suite" = "_common" ] && error "_common is not a valid test suite"
+	dirSuite="$dirTests/$suite"
+	[ -d "$dirSuite" ] || error "Test suite $suite not found"
+fi
+
+
+
+optClean=
+optNorun=
+optDebug=
+while [ $# -gt 0 ]
+do
+	case $1 in
+		-clean) optClean=1;;
+		-norun) optNorun=1;;
+		-debug) optDebug=1;;
+		*) syntaxError "Unknow option: $1"
+	esac
+	shift
+done
+
+buildStyle='test'
+[ -n "$optDebug" ] && buildStyle='debugtest'
+fileBuildConf="$dirProj/cfg/$buildStyle.cfg"
+[ -f "$fileBuildConf" ] || error "Build style $buildStyle not found"
+
+
+[ ! -d "$dirSrcBuild" ] && mkdir -p "$dirSrcBuild"
+(
+	cd "$dirSrcBuild"
+	if [ -z "$optClean" ]
+	then
+		"$dirProj/build" "$buildStyle"
+	else
+		"$dirProj/build" "$buildStyle" -clean
+	fi
+)
+
+
+printf '\n\n\n=== BUILDING TESTS ===\n\n'
+printf 'Building using build style: "%s".\n' "$buildStyle"
+printf 'Building test suite: "%s".\n' "$suite"
+
+
+if [ -z "$optClean" ] \
+	&& [ -f "$fileLastBuildConf" ] \
+	&& ! cmp -s "$fileLastBuildConf" "$fileBuildConf"
+then
+	optClean=1
+	printf '\nForcing clean buid because build config has changed.\n'
+fi
+
+[ -n "$optClean" ] && cleanBuildProducts
+
+[ ! -f "$fileLastBuildConf" ] && cp "$fileBuildConf" "$fileLastBuildConf"
+[ ! -d "$dirObj" ] && mkdir -p "$dirObj"
+
+
+config=$( parseBuildSettingsFile "$fileLastBuildConf" )
+
+if [ "$suite" = "all" ]
+then
+	find "$dirSuite" -name "*.c" >"$fileSrcFileList"
+	find "$dirSuite" -name "*.m" >>"$fileSrcFileList"
+else
+	find "$dirSuite" "$commonSuite" -name "*.c" >"$fileSrcFileList"
+	find "$dirSuite" "$commonSuite" -name "*.m" >>"$fileSrcFileList"
+fi
+
+while IFS='' read -r nextSrcFile
+do
+	relativeSrcFile=$( relativePath "$nextSrcFile" "$dirTests" )
+	nextObjFile="$dirObj/$relativeSrcFile.o"
+	relativeObjFile=$( relativePath "$nextObjFile" "$dirObj" )
+
+	printf '\nBuilding: "%s"\n' "$relativeSrcFile"
+
+	flagsFile=$( findCompileFlags "$nextSrcFile" "$dirProj" )
+	flagsFileDir="$( dirname "$flagsFile" )"
+	flags=$( parseBuildSettingsFile "$flagsFile" )
+
+	if ! objectFileIsOutdated \
+		"$nextObjFile" "$nextSrcFile" "$flags" "$flagsFileDir"
+	then
+		printf 'Object file up to date: "%s"\n' "$relativeObjFile"
+		continue
+	fi
+
+	mkdir -p "$( dirname "$nextObjFile" )"
+
+	buildCmd="clang -c -o $( quote "$nextObjFile" )"
+	buildCmd="$buildCmd $flags $config"
+	buildCmd="$buildCmd $(quote "$nextSrcFile" )"
+
+	( cd "$flagsFileDir" && eval "$buildCmd" )
+
+	relativeObjFile=$( relativePath "$nextObjFile" "$dirObj" )
+	printf 'Created: "%s"\n' "$relativeObjFile"
+
+done <"$fileSrcFileList"
+
+printf '\n=== BUILDING DONE ===\n'
+
+
+
+printf '\n\n\n=== LINKING TESTS ===\n'
+
+for dirSuite in "$dirObj/"*
+do
+	[ -d "$dirSuite" ] || continue
+
+	binName=$( basename "$dirSuite" )
+	case $binName in
+		"_"*) continue;;
+	esac
+
+	[ "$suite" != "all" ] && [ "$binName" != "$suite" ] && continue
+
+	find "$dirSuite" "$dirObj/_common" "$dirSrcBuild/src" \
+		-name "*.o" >"$fileObjFileList"
+
+	objFileList=
+	while IFS='' read -r nextObjFile
+	do
+		objFileList="$objFileList $( quote "$nextObjFile" )"
+	done <"$fileObjFileList"
+
+	binPath="$dirBin/$binName"
+	printf '\nLinking: "%s"\n' "$binName"
+
+	if [ -f "$binPath" ] \
+		&& ! eval "anyFileIsNewerThan $(quote "$binPath" ) $objFileList"
+	then
+		printf 'Test file up to date: "%s"\n' "$binName"
+		continue
+	fi
+
+	mkdir -p "$dirBin"
+
+	linkcmd="clang -o $( quote "$binPath" )"
+
+	if shouldLinkAddressSanitizer "$config"
+	then
+		linkcmd="$linkcmd -fsanitize=address"
+	fi
+
+	linkcmd="$linkcmd $objFileList"
+
+	eval "$linkcmd"
+	printf 'Created: "%s"\n' "$binName"
+
+done
+
+printf '\n=== LINKING DONE ===\n'
+
+
+[ -n "$optNorun" ] && exit 0
+
+
+printf '\n\n\n=== RUNNING TESTS ===\n'
+
+if [ "$suite" = "all" ]
+then
+	for bin in "$dirBin/"*
+	do
+		[ -x "$bin" ] || continue
+		printf '\nRunning suite: "%s"\n' "$( basename "$bin" )"
+		"$bin"
+	done
+else
+	printf '\nRunning suite: "%s"\n' "$suite"
+	"$dirBin/$suite"
+fi
+
+printf '\n=== RUNNING DONE ===\n'
